@@ -3,8 +3,8 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import SparklineChart from './components/SparklineChart.vue'
 import type { AssetKind, EtfTimeSeries } from './services/alphaVantage'
 import { fetchAssetTimeSeries } from './services/alphaVantage'
-import type { NewsArticle } from './services/newsApi'
-import { fetchFrenchBusinessNews } from './services/newsApi'
+import type { NewsArticle, NewsCategory } from './services/newsApi'
+import { fetchFrenchBusinessNews, inferNewsCategory } from './services/newsApi'
 import { loadEtfCache, loadEtfFileCache, loadEtfFileSavedAt, saveEtfCache } from './services/etfCache'
 import {
   loadNewsFileCache,
@@ -18,6 +18,7 @@ interface AssetDefinition {
   name: string
   type: 'ETF' | 'Titre'
   kind: AssetKind
+  icon: string
   color: string
   units: number
   valueEur: number
@@ -32,23 +33,23 @@ interface DashboardRow extends AssetDefinition {
 }
 
 const assetList: AssetDefinition[] = [
-  { symbol: 'VWCE.DE', name: 'FTSE All-World USD (Acc)', type: 'ETF', kind: 'equity', color: '#4dd0ff', units: 1.8608, valueEur: 272.79, weightPct: 1.18 },
-  { symbol: 'EIMI.L', name: 'MSCI Emerging Markets EUR (Acc)', type: 'ETF', kind: 'equity', color: '#76f2b9', units: 21.5476, valueEur: 139.51, weightPct: 5.24 },
-  { symbol: 'SXR8.DE', name: 'Core S&P 500 USD (Acc)', type: 'ETF', kind: 'equity', color: '#ffd166', units: 0.006377, valueEur: 3.98 },
-  { symbol: 'GLD', name: 'Or', type: 'ETF', kind: 'equity', color: '#f4c542', units: 0, valueEur: 0 },
-  { symbol: 'SLV', name: 'Argent', type: 'ETF', kind: 'equity', color: '#b9c6d8', units: 0, valueEur: 0 },
-  { symbol: 'ADA', name: 'Cardano', type: 'Titre', kind: 'crypto', color: '#6aa2ff', units: 136.444371, valueEur: 30.99, weightPct: 3.17 },
-  { symbol: 'GOOGL', name: 'Alphabet (A)', type: 'Titre', kind: 'equity', color: '#b9f871', units: 0.07395, valueEur: 19.06, weightPct: 4.68 },
-  { symbol: 'NVDA', name: 'NVIDIA', type: 'Titre', kind: 'equity', color: '#7dff8f', units: 0.12338, valueEur: 19.02, weightPct: 4.9 },
-  { symbol: 'RKLB', name: 'Rocket Lab Corp. Registered Shares DL-,0001', type: 'Titre', kind: 'equity', color: '#ff8f7a', units: 0.32258, valueEur: 18.55, weightPct: 7.26 },
-  { symbol: 'AVGO', name: 'Broadcom', type: 'Titre', kind: 'equity', color: '#ff9ed6', units: 0.066577, valueEur: 17.87, weightPct: 10.67 },
-  { symbol: 'AMZN', name: 'Amazon.com', type: 'Titre', kind: 'equity', color: '#f7b267', units: 0.100633, valueEur: 17.69, weightPct: 11.54 },
-  { symbol: 'MELI', name: 'MercadoLibre', type: 'Titre', kind: 'equity', color: '#ffe45e', units: 0.0115, valueEur: 16.67, weightPct: 16.67 },
-  { symbol: 'PYPL', name: 'PayPal', type: 'Titre', kind: 'equity', color: '#6db6ff', units: 0.396353, valueEur: 15.45, weightPct: 22.74 },
-  { symbol: 'BTC', name: 'Bitcoin', type: 'Titre', kind: 'crypto', color: '#f7931a', units: 0.00026, valueEur: 15.01, weightPct: 28.3 },
-  { symbol: 'SHOP', name: 'Shopify (A)', type: 'Titre', kind: 'equity', color: '#95f28f', units: 0.142348, valueEur: 13.87, weightPct: 30.66 },
-  { symbol: 'TTD', name: 'The Trade Desk (A)', type: 'Titre', kind: 'equity', color: '#b892ff', units: 0.610035, valueEur: 12.48, weightPct: 37.61 },
-  { symbol: 'TSLA', name: 'Tesla', type: 'Titre', kind: 'equity', color: '#ff6464', units: 0.0255, valueEur: 8.56, weightPct: 12.33 },
+  { symbol: 'VWCE.DE', name: 'FTSE All-World USD (Acc)', type: 'ETF', kind: 'equity', icon: '🌍', color: '#4dd0ff', units: 1.8608, valueEur: 272.79, weightPct: 1.18 },
+  { symbol: 'EIMI.L', name: 'MSCI Emerging Markets EUR (Acc)', type: 'ETF', kind: 'equity', icon: '🌱', color: '#76f2b9', units: 21.5476, valueEur: 139.51, weightPct: 5.24 },
+  { symbol: 'SXR8.DE', name: 'Core S&P 500 USD (Acc)', type: 'ETF', kind: 'equity', icon: '🇺🇸', color: '#ffd166', units: 0.006377, valueEur: 3.98 },
+  { symbol: 'GLD', name: 'Or', type: 'ETF', kind: 'equity', icon: '🧱', color: '#f4c542', units: 0, valueEur: 0 },
+  { symbol: 'SLV', name: 'Argent', type: 'ETF', kind: 'equity', icon: '🥈', color: '#b9c6d8', units: 0, valueEur: 0 },
+  { symbol: 'ADA', name: 'Cardano', type: 'Titre', kind: 'crypto', icon: '🔷', color: '#6aa2ff', units: 136.444371, valueEur: 30.99, weightPct: 3.17 },
+  { symbol: 'GOOGL', name: 'Alphabet (A)', type: 'Titre', kind: 'equity', icon: '🔍', color: '#b9f871', units: 0.07395, valueEur: 19.06, weightPct: 4.68 },
+  { symbol: 'NVDA', name: 'NVIDIA', type: 'Titre', kind: 'equity', icon: '🟩', color: '#7dff8f', units: 0.12338, valueEur: 19.02, weightPct: 4.9 },
+  { symbol: 'RKLB', name: 'Rocket Lab Corp. Registered Shares DL-,0001', type: 'Titre', kind: 'equity', icon: '🚀', color: '#ff8f7a', units: 0.32258, valueEur: 18.55, weightPct: 7.26 },
+  { symbol: 'AVGO', name: 'Broadcom', type: 'Titre', kind: 'equity', icon: '📡', color: '#ff9ed6', units: 0.066577, valueEur: 17.87, weightPct: 10.67 },
+  { symbol: 'AMZN', name: 'Amazon.com', type: 'Titre', kind: 'equity', icon: '📦', color: '#f7b267', units: 0.100633, valueEur: 17.69, weightPct: 11.54 },
+  { symbol: 'MELI', name: 'MercadoLibre', type: 'Titre', kind: 'equity', icon: '🛒', color: '#ffe45e', units: 0.0115, valueEur: 16.67, weightPct: 16.67 },
+  { symbol: 'PYPL', name: 'PayPal', type: 'Titre', kind: 'equity', icon: '💳', color: '#6db6ff', units: 0.396353, valueEur: 15.45, weightPct: 22.74 },
+  { symbol: 'BTC', name: 'Bitcoin', type: 'Titre', kind: 'crypto', icon: '₿', color: '#f7931a', units: 0.00026, valueEur: 15.01, weightPct: 28.3 },
+  { symbol: 'SHOP', name: 'Shopify (A)', type: 'Titre', kind: 'equity', icon: '🛍️', color: '#95f28f', units: 0.142348, valueEur: 13.87, weightPct: 30.66 },
+  { symbol: 'TTD', name: 'The Trade Desk (A)', type: 'Titre', kind: 'equity', icon: '📊', color: '#b892ff', units: 0.610035, valueEur: 12.48, weightPct: 37.61 },
+  { symbol: 'TSLA', name: 'Tesla', type: 'Titre', kind: 'equity', icon: '⚡', color: '#ff6464', units: 0.0255, valueEur: 8.56, weightPct: 12.33 },
 ]
 
 const AUTH_USERNAME = 'antoine'
@@ -76,6 +77,17 @@ const newsLastUpdated = ref('')
 const newsDataSource = ref<'api' | 'file-cache' | 'local-cache'>('file-cache')
 const newsLastDataAtMs = ref<number | null>(null)
 const newsArticles = ref<NewsArticle[]>([])
+const selectedNewsCategory = ref<'all' | NewsCategory>('all')
+
+const newsCategoryOptions: { id: 'all' | NewsCategory; label: string }[] = [
+  { id: 'all', label: 'Toutes' },
+  { id: 'bourse', label: 'Bourse' },
+  { id: 'economie', label: 'Économie' },
+  { id: 'crypto', label: 'Crypto' },
+  { id: 'tech', label: 'Tech' },
+  { id: 'entreprises', label: 'Entreprises' },
+  { id: 'autres', label: 'Autres' },
+]
 
 const nowMs = ref(Date.now())
 let refreshClock: number | undefined
@@ -145,6 +157,14 @@ const nextNewsRefreshLabel = computed(() => {
   }
 
   return formatRemaining(REFRESH_INTERVAL_MS - (nowMs.value - newsLastDataAtMs.value))
+})
+
+const filteredNewsArticles = computed(() => {
+  if (selectedNewsCategory.value === 'all') {
+    return newsArticles.value
+  }
+
+  return newsArticles.value.filter((article) => article.category === selectedNewsCategory.value)
 })
 
 function formatPercent(value: number) {
@@ -217,6 +237,15 @@ function applyLastDataTimestamp(rawDate: string) {
 function applyNewsLastDataTimestamp(rawDate: string) {
   const parsed = new Date(rawDate).getTime()
   newsLastDataAtMs.value = Number.isFinite(parsed) ? parsed : null
+}
+
+function normalizeNewsArticles(articles: NewsArticle[]): NewsArticle[] {
+  return articles.map((article) => ({
+    ...article,
+    category:
+      article.category ||
+      inferNewsCategory(article.title || 'Sans titre', article.description || 'Description indisponible.'),
+  }))
 }
 
 async function syncCooldownFromFileSavedAt() {
@@ -302,7 +331,7 @@ async function refreshNewsSession() {
 
     const fileCached = await loadNewsFileCache()
     if (fileCached?.data?.length) {
-      newsArticles.value = fileCached.data
+      newsArticles.value = normalizeNewsArticles(fileCached.data)
       newsDataSource.value = 'file-cache'
       newsLastUpdated.value = `${new Date(fileCached.savedAt).toLocaleString('fr-FR')} (fichier)`
       applyNewsLastDataTimestamp(fileCached.savedAt)
@@ -311,14 +340,14 @@ async function refreshNewsSession() {
 
     const localCached = loadNewsLocalCache()
     if (localCached?.data?.length) {
-      newsArticles.value = localCached.data
+      newsArticles.value = normalizeNewsArticles(localCached.data)
       newsDataSource.value = 'local-cache'
       newsLastUpdated.value = `${new Date(localCached.savedAt).toLocaleString('fr-FR')} (local)`
       applyNewsLastDataTimestamp(localCached.savedAt)
       return
     }
 
-    const articles = await fetchFrenchBusinessNews(newsApiKey)
+    const articles = normalizeNewsArticles(await fetchFrenchBusinessNews(newsApiKey))
     saveNewsLocalCache(articles)
 
     newsArticles.value = articles
@@ -442,11 +471,14 @@ onUnmounted(() => {
 
           <h2 class="section-title">ETF</h2>
           <section class="grid">
-            <article v-for="row in etfRows" :key="row.symbol" class="card">
+            <article v-for="row in etfRows" :key="row.symbol" class="card" :style="{ '--asset-color': row.color }">
               <div class="card-top">
-                <div>
-                  <p class="symbol">{{ row.symbol }}</p>
-                  <h3>{{ row.name }}</h3>
+                <div class="asset-head">
+                  <div class="asset-icon">{{ row.icon }}</div>
+                  <div>
+                    <p class="symbol">{{ row.symbol }}</p>
+                    <h3>{{ row.name }}</h3>
+                  </div>
                   <p class="category">Type: {{ row.type }}</p>
                 </div>
                 <div class="price-block">
@@ -469,11 +501,14 @@ onUnmounted(() => {
 
           <h2 class="section-title">Titres</h2>
           <section class="grid">
-            <article v-for="row in titleRows" :key="row.symbol" class="card">
+            <article v-for="row in titleRows" :key="row.symbol" class="card" :style="{ '--asset-color': row.color }">
               <div class="card-top">
-                <div>
-                  <p class="symbol">{{ row.symbol }}</p>
-                  <h3>{{ row.name }}</h3>
+                <div class="asset-head">
+                  <div class="asset-icon">{{ row.icon }}</div>
+                  <div>
+                    <p class="symbol">{{ row.symbol }}</p>
+                    <h3>{{ row.name }}</h3>
+                  </div>
                   <p class="category">Type: {{ row.kind === 'crypto' ? 'Crypto' : 'Action' }}</p>
                 </div>
                 <div class="price-block">
@@ -508,11 +543,23 @@ onUnmounted(() => {
         <p v-if="!canRefreshNews && nextNewsRefreshLabel" class="cooldown">
           Actualisation actualités disponible dans: {{ nextNewsRefreshLabel }}
         </p>
+        <div class="news-categories">
+          <button
+            v-for="option in newsCategoryOptions"
+            :key="option.id"
+            class="news-cat-btn"
+            :class="selectedNewsCategory === option.id ? 'active' : ''"
+            @click="selectedNewsCategory = option.id"
+          >
+            {{ option.label }}
+          </button>
+        </div>
 
         <section v-if="newsError" class="state state-error">{{ newsError }}</section>
         <section v-else-if="newsLoading" class="state">Chargement des actualités...</section>
+        <section v-else-if="!filteredNewsArticles.length" class="state">Aucun article pour cette catégorie.</section>
         <section v-else class="news-grid">
-          <article v-for="article in newsArticles" :key="article.url" class="news-card">
+          <article v-for="article in filteredNewsArticles" :key="article.url" class="news-card">
             <img v-if="article.imageUrl" :src="article.imageUrl" :alt="article.title" class="news-image" />
             <div class="news-content">
               <p class="news-source">{{ article.source }} · {{ new Date(article.publishedAt).toLocaleString('fr-FR') }}</p>
@@ -623,6 +670,26 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
 .refresh:disabled { opacity: 0.65; cursor: not-allowed; }
 
 .cooldown { margin: 0 0 1rem; color: #9eb4e8; font-size: 0.88rem; }
+.news-categories {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0 0 1rem;
+}
+.news-cat-btn {
+  border: 1px solid #2c3b60;
+  border-radius: 999px;
+  background: #111a30;
+  color: #9eb4e8;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.news-cat-btn.active {
+  background: #1a3f66;
+  border-color: #3fa7ff;
+  color: #d9eeff;
+}
 .state {
   padding: 1rem;
   border-radius: 0.9rem;
@@ -637,14 +704,31 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
 .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
 
 .card {
+  --asset-color: #4dd0ff;
   padding: 1rem;
   border-radius: 1rem;
-  border: 1px solid #273450;
+  border: 1px solid color-mix(in srgb, var(--asset-color) 45%, #273450);
+  border-left: 4px solid var(--asset-color);
   background: linear-gradient(165deg, rgba(17, 25, 46, 0.94), rgba(9, 14, 24, 0.94));
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28), 0 0 0 1px color-mix(in srgb, var(--asset-color) 22%, transparent);
 }
 
 .card-top { display: flex; justify-content: space-between; gap: 0.8rem; }
+.asset-head {
+  display: grid;
+  grid-template-columns: 2rem 1fr;
+  gap: 0.55rem;
+}
+.asset-icon {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.65rem;
+  display: grid;
+  place-items: center;
+  font-size: 1rem;
+  background: color-mix(in srgb, var(--asset-color) 25%, #0f162b);
+  border: 1px solid color-mix(in srgb, var(--asset-color) 55%, #2a3554);
+}
 .symbol { margin: 0; font-size: 0.78rem; letter-spacing: 0.15em; color: #95a5cf; }
 .category { margin: 0; color: #8ea4db; font-size: 0.84rem; }
 .price-block { text-align: right; }
