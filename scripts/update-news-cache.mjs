@@ -1,6 +1,6 @@
 import { writeFile } from 'node:fs/promises'
 
-const API_KEY = process.env.NEWS_API_KEY || 'cbd2d62761004952b282de8764b385b6'
+const API_KEY = process.env.NEWS_API_KEY || ''
 const NEWS_URL = 'https://newsapi.org/v2/everything'
 const CATEGORY_QUERIES = {
   bourse: '(bourse OR indice OR action OR ETF OR trading OR CAC 40 OR Nasdaq)',
@@ -8,6 +8,10 @@ const CATEGORY_QUERIES = {
   crypto: '(crypto OR bitcoin OR ethereum OR blockchain OR cardano OR BTC OR ADA)',
   tech: '(technologie OR tech OR IA OR intelligence artificielle OR semi-conducteur)',
   entreprises: '(entreprise OR entreprises OR startup OR acquisition OR fusion OR resultats)',
+}
+
+if (!API_KEY) {
+  throw new Error('NEWS_API_KEY manquant')
 }
 
 function inferNewsCategory(title, description) {

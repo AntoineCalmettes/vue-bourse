@@ -1,10 +1,14 @@
 import { writeFile } from 'node:fs/promises'
 
-const API_KEY = process.env.ALPHA_VANTAGE_API_KEY || 'NX5TOEVPMER3P6BG'
-const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || 'd6ju03hr01qkvh5rc2bgd6ju03hr01qkvh5rc2c0'
+const API_KEY = process.env.ALPHA_VANTAGE_API_KEY || ''
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || ''
 const BASE_URL = 'https://www.alphavantage.co/query'
 const FINNHUB_BASE_URL = 'https://finnhub.io/api/v1'
 const YAHOO_BASE_URL = 'https://query1.finance.yahoo.com/v8/finance/chart'
+
+if (!API_KEY) {
+  throw new Error('ALPHA_VANTAGE_API_KEY manquant')
+}
 
 const ASSETS = [
   { symbol: 'VWCE.DE', kind: 'equity' },

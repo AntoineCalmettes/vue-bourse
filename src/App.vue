@@ -2,16 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import SparklineChart from './components/SparklineChart.vue'
 import type { AssetKind, EtfTimeSeries } from './services/alphaVantage'
-import { fetchAssetTimeSeries } from './services/alphaVantage'
 import type { NewsArticle, NewsCategory } from './services/newsApi'
-import { fetchFrenchBusinessNews, inferNewsCategory } from './services/newsApi'
-import { loadEtfCache, loadEtfFileCache, loadEtfFileSavedAt, saveEtfCache } from './services/etfCache'
-import {
-  loadNewsFileCache,
-  loadNewsFileSavedAt,
-  loadNewsLocalCache,
-  saveNewsLocalCache,
-} from './services/newsCache'
 
 interface AssetDefinition {
   symbol: string
@@ -34,6 +25,19 @@ interface DashboardRow extends AssetDefinition {
   raw?: unknown
 }
 
+interface MarketsApiResponse {
+  source: string
+  savedAt: string
+  data: EtfTimeSeries[]
+  failures?: string[]
+}
+
+interface NewsApiResponse {
+  source: string
+  savedAt: string
+  data: NewsArticle[]
+}
+
 const assetList: AssetDefinition[] = [
   { symbol: 'VWCE.DE', name: 'FTSE All-World USD (Acc)', type: 'ETF', kind: 'equity', icon: '🌍', color: '#4dd0ff', units: 1.8608, valueEur: 272.79, weightPct: 1.18 },
   { symbol: 'EIMI.L', name: 'MSCI Emerging Markets EUR (Acc)', type: 'ETF', kind: 'equity', icon: '🌱', color: '#76f2b9', units: 21.5476, valueEur: 139.51, weightPct: 5.24 },
@@ -54,15 +58,10 @@ const assetList: AssetDefinition[] = [
   { symbol: 'TSLA', name: 'Tesla', type: 'Titre', kind: 'equity', icon: '⚡', color: '#ff6464', units: 0.0255, valueEur: 8.56, weightPct: 12.33 },
 ]
 
-const AUTH_USERNAME = 'antoine'
-const AUTH_PASSWORD = 'antoine'
 const AUTH_KEY = 'dashboard-auth'
+const AUTH_TOKEN_KEY = 'dashboard-token'
 const REFRESH_INTERVAL_MS = 3 * 60 * 60 * 1000
-const MARKET_CACHE_ONLY = true
-
-const apiKey = import.meta.env.VITE_ALPHA_VANTAGE_API_KEY || 'NX5TOEVPMER3P6BG'
-const finnhubApiKey = import.meta.env.VITE_FINNHUB_API_KEY || 'd6ju03hr01qkvh5rc2bgd6ju03hr01qkvh5rc2c0'
-const newsApiKey = import.meta.env.VITE_NEWS_API_KEY || 'cbd2d62761004952b282de8764b385b6'
+const authApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
 
 const activeSession = ref<'market' | 'news'>('market')
 
@@ -72,13 +71,13 @@ const warningMessage = ref('')
 const authError = ref('')
 const lastUpdated = ref('')
 const rows = ref<DashboardRow[]>([])
-const dataSource = ref<'api' | 'file-cache' | 'local-cache'>('api')
+const dataSource = ref<'external-api' | 'db-cache' | 'db-cache-stale'>('db-cache')
 const lastDataAtMs = ref<number | null>(null)
 
 const newsLoading = ref(false)
 const newsError = ref('')
 const newsLastUpdated = ref('')
-const newsDataSource = ref<'api' | 'file-cache' | 'local-cache'>('file-cache')
+const newsDataSource = ref<'external-api' | 'db-cache' | 'db-cache-stale'>('db-cache')
 const newsLastDataAtMs = ref<number | null>(null)
 const newsArticles = ref<NewsArticle[]>([])
 const selectedNewsCategory = ref<'all' | NewsCategory>('all')
@@ -98,7 +97,7 @@ let refreshClock: number | undefined
 
 const username = ref('')
 const password = ref('')
-const isAuthenticated = ref(sessionStorage.getItem(AUTH_KEY) === '1')
+const isAuthenticated = ref(Boolean(sessionStorage.getItem(AUTH_TOKEN_KEY)))
 const selectedAsset = ref<DashboardRow | null>(null)
 const modalRange = ref<'5d' | '1m' | '3m' | 'max'>('1m')
 
@@ -188,12 +187,6 @@ function formatNumber(value: number, maxFractionDigits = 2) {
   return value.toLocaleString('fr-FR', {
     minimumFractionDigits: 0,
     maximumFractionDigits: maxFractionDigits,
-  })
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms)
   })
 }
 
@@ -398,25 +391,6 @@ function mapRowsFromSeries(series: EtfTimeSeries[]): DashboardRow[] {
   })
 }
 
-async function loadFromApi(): Promise<{ series: EtfTimeSeries[]; failures: string[] }> {
-  const series: EtfTimeSeries[] = []
-  const failures: string[] = []
-
-  for (const [index, asset] of assetList.entries()) {
-    try {
-      series.push(await fetchAssetTimeSeries(asset.symbol, apiKey, asset.kind, finnhubApiKey))
-    } catch {
-      failures.push(asset.name)
-    }
-
-    if (index < assetList.length - 1) {
-      await sleep(1100)
-    }
-  }
-
-  return { series, failures }
-}
-
 function applyLastDataTimestamp(rawDate: string) {
   const parsed = new Date(rawDate).getTime()
   lastDataAtMs.value = Number.isFinite(parsed) ? parsed : null
@@ -427,26 +401,20 @@ function applyNewsLastDataTimestamp(rawDate: string) {
   newsLastDataAtMs.value = Number.isFinite(parsed) ? parsed : null
 }
 
-function normalizeNewsArticles(articles: NewsArticle[]): NewsArticle[] {
-  return articles.map((article) => ({
-    ...article,
-    category:
-      article.category ||
-      inferNewsCategory(article.title || 'Sans titre', article.description || 'Description indisponible.'),
-  }))
+function getAuthToken() {
+  return sessionStorage.getItem(AUTH_TOKEN_KEY) || ''
 }
 
-async function syncCooldownFromFileSavedAt() {
-  const fileSavedAt = await loadEtfFileSavedAt()
-  if (fileSavedAt) {
-    applyLastDataTimestamp(fileSavedAt)
-  }
-}
-
-async function syncNewsCooldownFromFileSavedAt() {
-  const fileSavedAt = await loadNewsFileSavedAt()
-  if (fileSavedAt) {
-    applyNewsLastDataTimestamp(fileSavedAt)
+async function parseJsonResponse<T>(response: Response, context: string): Promise<T> {
+  const raw = await response.text()
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    const preview = raw.slice(0, 120).replace(/\s+/g, ' ')
+    throw new Error(
+      `${context}: réponse non JSON (${response.status}) depuis ${response.url}. ` +
+        `Vérifie VITE_API_BASE_URL (actuel: ${authApiBaseUrl}). Début réponse: ${preview}`
+    )
   }
 }
 
@@ -460,45 +428,28 @@ async function refreshDashboard() {
   warningMessage.value = ''
 
   try {
-    await syncCooldownFromFileSavedAt()
+    const token = getAuthToken()
+    const response = await fetch(`${authApiBaseUrl}/data/markets`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    })
 
-    const fileCached = await loadEtfFileCache()
-    if (fileCached?.data?.length) {
-      rows.value = mapRowsFromSeries(fileCached.data)
-      dataSource.value = 'file-cache'
-      lastUpdated.value = `${new Date(fileCached.savedAt).toLocaleString('fr-FR')} (fichier)`
-      applyLastDataTimestamp(fileCached.savedAt)
-      return
+    const payload = await parseJsonResponse<MarketsApiResponse & { message?: string }>(
+      response,
+      'Erreur marchés'
+    )
+    if (!response.ok) {
+      throw new Error(payload.message || 'Erreur API marchés.')
     }
 
-    if (MARKET_CACHE_ONLY) {
-      throw new Error("Mode cache actif: etf-cache.json est requis. Aucun appel API n'est fait.")
-    }
+    rows.value = mapRowsFromSeries(payload.data || [])
+    dataSource.value = (payload.source || 'db-cache') as 'external-api' | 'db-cache' | 'db-cache-stale'
+    lastUpdated.value = `${new Date(payload.savedAt).toLocaleString('fr-FR')} (${payload.source})`
+    applyLastDataTimestamp(payload.savedAt)
 
-    const localCached = loadEtfCache()
-    if (localCached?.data?.length) {
-      rows.value = mapRowsFromSeries(localCached.data)
-      dataSource.value = 'local-cache'
-      lastUpdated.value = `${new Date(localCached.savedAt).toLocaleString('fr-FR')} (local)`
-      applyLastDataTimestamp(localCached.savedAt)
-      return
-    }
-
-    const { series, failures } = await loadFromApi()
-    if (!series.length) {
-      throw new Error('Aucune donnée API disponible pour les actifs demandés.')
-    }
-
-    saveEtfCache(series)
-
-    rows.value = mapRowsFromSeries(series)
-    dataSource.value = 'api'
-    const nowIso = new Date().toISOString()
-    lastUpdated.value = `${new Date(nowIso).toLocaleString('fr-FR')} (api)`
-    applyLastDataTimestamp(nowIso)
-
-    if (failures.length) {
-      warningMessage.value = `Données indisponibles pour: ${failures.join(', ')}`
+    if (payload.failures?.length) {
+      warningMessage.value = `Données indisponibles pour: ${payload.failures.join(', ')}`
     }
   } catch (error) {
     rows.value = []
@@ -517,34 +468,26 @@ async function refreshNewsSession(forceApi = false) {
   newsError.value = ''
 
   try {
-    await syncNewsCooldownFromFileSavedAt()
+    const token = getAuthToken()
+    const query = forceApi ? '?force=1' : ''
+    const response = await fetch(`${authApiBaseUrl}/data/news${query}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    })
+    const payload = await parseJsonResponse<NewsApiResponse & { message?: string }>(
+      response,
+      'Erreur actualités'
+    )
 
-    const fileCached = await loadNewsFileCache()
-    if (!forceApi && fileCached?.data?.length) {
-      newsArticles.value = normalizeNewsArticles(fileCached.data)
-      newsDataSource.value = 'file-cache'
-      newsLastUpdated.value = `${new Date(fileCached.savedAt).toLocaleString('fr-FR')} (fichier)`
-      applyNewsLastDataTimestamp(fileCached.savedAt)
-      return
+    if (!response.ok) {
+      throw new Error(payload.message || 'Erreur API actualités.')
     }
 
-    const localCached = loadNewsLocalCache()
-    if (!forceApi && localCached?.data?.length) {
-      newsArticles.value = normalizeNewsArticles(localCached.data)
-      newsDataSource.value = 'local-cache'
-      newsLastUpdated.value = `${new Date(localCached.savedAt).toLocaleString('fr-FR')} (local)`
-      applyNewsLastDataTimestamp(localCached.savedAt)
-      return
-    }
-
-    const articles = normalizeNewsArticles(await fetchFrenchBusinessNews(newsApiKey))
-    saveNewsLocalCache(articles)
-
-    newsArticles.value = articles
-    newsDataSource.value = 'api'
-    const nowIso = new Date().toISOString()
-    newsLastUpdated.value = `${new Date(nowIso).toLocaleString('fr-FR')} (api)`
-    applyNewsLastDataTimestamp(nowIso)
+    newsArticles.value = payload.data || []
+    newsDataSource.value = (payload.source || 'db-cache') as 'external-api' | 'db-cache' | 'db-cache-stale'
+    newsLastUpdated.value = `${new Date(payload.savedAt).toLocaleString('fr-FR')} (${payload.source})`
+    applyNewsLastDataTimestamp(payload.savedAt)
   } catch (error) {
     newsArticles.value = []
     newsError.value = error instanceof Error ? error.message : 'Erreur inconnue.'
@@ -553,22 +496,46 @@ async function refreshNewsSession(forceApi = false) {
   }
 }
 
-function submitLogin() {
+async function submitLogin() {
   authError.value = ''
 
-  if (username.value === AUTH_USERNAME && password.value === AUTH_PASSWORD) {
+  if (!username.value.trim() || !password.value) {
+    authError.value = 'Email et mot de passe requis.'
+    return
+  }
+
+  try {
+    const response = await fetch(`${authApiBaseUrl}/auth/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email: username.value.trim(),
+        password: password.value,
+      }),
+    })
+
+    const data = await parseJsonResponse<{ token?: string; message?: string }>(response, 'Erreur login')
+    if (!response.ok || !data?.token) {
+      authError.value = data?.message || 'Identifiants invalides.'
+      return
+    }
+
+    sessionStorage.setItem(AUTH_TOKEN_KEY, data.token)
     sessionStorage.setItem(AUTH_KEY, '1')
     isAuthenticated.value = true
     void refreshDashboard()
     void refreshNewsSession()
     return
+  } catch (_error) {
+    authError.value = "Impossible de contacter l'API d'authentification."
   }
-
-  authError.value = 'Identifiants invalides.'
 }
 
 function logout() {
   sessionStorage.removeItem(AUTH_KEY)
+  sessionStorage.removeItem(AUTH_TOKEN_KEY)
   isAuthenticated.value = false
   username.value = ''
   password.value = ''
@@ -594,9 +561,6 @@ onMounted(() => {
     nowMs.value = Date.now()
   }, 1000)
 
-  void syncCooldownFromFileSavedAt()
-  void syncNewsCooldownFromFileSavedAt()
-
   if (isAuthenticated.value) {
     void refreshDashboard()
     void refreshNewsSession()
@@ -619,7 +583,7 @@ onUnmounted(() => {
         <p class="subtitle">Entrez vos identifiants pour afficher Marchés et Actualités.</p>
 
         <label class="field">
-          <span>Username</span>
+          <span>Email</span>
           <input v-model="username" type="text" autocomplete="username" />
         </label>
 
@@ -639,7 +603,7 @@ onUnmounted(() => {
         <div>
           <p class="eyebrow">ALPHA VANTAGE + NEWS API</p>
           <h1>Dashboard Marchés & Actualités</h1>
-          <p class="subtitle">Session française avec cache JSON fichier.</p>
+          <p class="subtitle">Session française avec cache base de données (3h).</p>
         </div>
 
         <div class="hero-actions">
