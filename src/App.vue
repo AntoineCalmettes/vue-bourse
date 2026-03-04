@@ -30,6 +30,8 @@ interface DashboardRow extends AssetDefinition {
   price: number
   dailyChangePct: number
   monthChangePct: number
+  provider?: 'alpha_vantage' | 'finnhub' | 'yahoo'
+  raw?: unknown
 }
 
 const assetList: AssetDefinition[] = [
@@ -56,8 +58,10 @@ const AUTH_USERNAME = 'antoine'
 const AUTH_PASSWORD = 'antoine'
 const AUTH_KEY = 'dashboard-auth'
 const REFRESH_INTERVAL_MS = 3 * 60 * 60 * 1000
+const MARKET_CACHE_ONLY = true
 
 const apiKey = import.meta.env.VITE_ALPHA_VANTAGE_API_KEY || 'NX5TOEVPMER3P6BG'
+const finnhubApiKey = import.meta.env.VITE_FINNHUB_API_KEY || 'd6ju03hr01qkvh5rc2bgd6ju03hr01qkvh5rc2c0'
 const newsApiKey = import.meta.env.VITE_NEWS_API_KEY || 'cbd2d62761004952b282de8764b385b6'
 
 const activeSession = ref<'market' | 'news'>('market')
@@ -95,6 +99,15 @@ let refreshClock: number | undefined
 const username = ref('')
 const password = ref('')
 const isAuthenticated = ref(sessionStorage.getItem(AUTH_KEY) === '1')
+const selectedAsset = ref<DashboardRow | null>(null)
+const modalRange = ref<'5d' | '1m' | '3m' | 'max'>('1m')
+
+const modalRangeOptions: Array<{ id: '5d' | '1m' | '3m' | 'max'; label: string; days?: number }> = [
+  { id: '5d', label: '5j', days: 5 },
+  { id: '1m', label: '1m', days: 30 },
+  { id: '3m', label: '3m', days: 90 },
+  { id: 'max', label: 'Max' },
+]
 
 const etfRows = computed(() => rows.value.filter((entry) => entry.type === 'ETF'))
 const titleRows = computed(() => rows.value.filter((entry) => entry.type === 'Titre'))
@@ -189,12 +202,185 @@ function buildFallbackSeries(baseValue: number): number[] {
   return Array.from({ length: 30 }, (_, index) => base * (0.95 + (index / 29) * 0.08))
 }
 
+function extractCloses(entry: EtfTimeSeries): number[] {
+  if (Array.isArray(entry.closes) && entry.closes.length >= 2) {
+    return entry.closes
+  }
+
+  if (!entry.raw || typeof entry.raw !== 'object') {
+    return []
+  }
+
+  const raw = entry.raw as Record<string, unknown>
+
+  if (entry.provider === 'alpha_vantage') {
+    const daily = raw['Time Series (Daily)'] as Record<string, { '4. close': string }> | undefined
+    if (daily && typeof daily === 'object') {
+      return Object.entries(daily)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([, values]) => Number.parseFloat(values['4. close']))
+        .filter((value) => Number.isFinite(value))
+        .slice(-30)
+    }
+
+    const crypto = raw['Time Series (Digital Currency Daily)'] as Record<
+      string,
+      { '4b. close (EUR)': string }
+    > | undefined
+    if (crypto && typeof crypto === 'object') {
+      return Object.entries(crypto)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([, values]) => Number.parseFloat(values['4b. close (EUR)']))
+        .filter((value) => Number.isFinite(value))
+        .slice(-30)
+    }
+  }
+
+  if (entry.provider === 'finnhub') {
+    const c = raw.c
+    if (Array.isArray(c)) {
+      return c.filter((value): value is number => typeof value === 'number' && Number.isFinite(value)).slice(-30)
+    }
+  }
+
+  if (entry.provider === 'yahoo') {
+    const chart = (raw as { chart?: { result?: Array<{ indicators?: { quote?: Array<{ close?: Array<number | null> }> } }> } }).chart
+    const closes = chart?.result?.[0]?.indicators?.quote?.[0]?.close
+    if (Array.isArray(closes)) {
+      return closes.filter((value): value is number => typeof value === 'number' && Number.isFinite(value)).slice(-30)
+    }
+  }
+
+  return []
+}
+
+type DatedPoint = { ts: number; close: number }
+
+function getDatedSeriesFromRaw(row: DashboardRow): DatedPoint[] {
+  if (!row.raw || typeof row.raw !== 'object') {
+    return row.closes.map((close, index) => ({ ts: index, close }))
+  }
+
+  const raw = row.raw as Record<string, unknown>
+
+  if (row.provider === 'alpha_vantage') {
+    const daily = raw['Time Series (Daily)'] as Record<string, { '4. close': string }> | undefined
+    if (daily && typeof daily === 'object') {
+      return Object.entries(daily)
+        .map(([date, values]) => ({
+          ts: new Date(date).getTime(),
+          close: Number.parseFloat(values['4. close']),
+        }))
+        .filter((entry) => Number.isFinite(entry.ts) && Number.isFinite(entry.close))
+        .sort((a, b) => a.ts - b.ts)
+    }
+
+    const crypto = raw['Time Series (Digital Currency Daily)'] as Record<
+      string,
+      { '4b. close (EUR)': string }
+    > | undefined
+    if (crypto && typeof crypto === 'object') {
+      return Object.entries(crypto)
+        .map(([date, values]) => ({
+          ts: new Date(date).getTime(),
+          close: Number.parseFloat(values['4b. close (EUR)']),
+        }))
+        .filter((entry) => Number.isFinite(entry.ts) && Number.isFinite(entry.close))
+        .sort((a, b) => a.ts - b.ts)
+    }
+  }
+
+  if (row.provider === 'finnhub') {
+    const c = raw.c as unknown
+    const t = raw.t as unknown
+    if (Array.isArray(c) && Array.isArray(t)) {
+      return c
+        .map((close, index) => ({ close, ts: t[index] }))
+        .filter((entry) => typeof entry.close === 'number' && Number.isFinite(entry.close) && typeof entry.ts === 'number')
+        .map((entry) => ({ close: entry.close as number, ts: (entry.ts as number) * 1000 }))
+    }
+  }
+
+  if (row.provider === 'yahoo') {
+    const chart = (raw as {
+      chart?: {
+        result?: Array<{
+          timestamp?: number[]
+          indicators?: { quote?: Array<{ close?: Array<number | null> }> }
+        }>
+      }
+    }).chart
+    const result = chart?.result?.[0]
+    const timestamps = result?.timestamp
+    const closes = result?.indicators?.quote?.[0]?.close
+    if (Array.isArray(timestamps) && Array.isArray(closes)) {
+      return closes
+        .map((close, index) => ({ close, ts: timestamps[index] }))
+        .filter((entry) => typeof entry.close === 'number' && Number.isFinite(entry.close) && typeof entry.ts === 'number')
+        .map((entry) => ({ close: entry.close as number, ts: (entry.ts as number) * 1000 }))
+    }
+  }
+
+  return row.closes.map((close, index) => ({ ts: index, close }))
+}
+
+const modalSeries = computed(() => {
+  if (!selectedAsset.value) {
+    return [] as DatedPoint[]
+  }
+
+  const series = getDatedSeriesFromRaw(selectedAsset.value)
+  if (!series.length) {
+    return []
+  }
+
+  const selected = modalRangeOptions.find((option) => option.id === modalRange.value)
+  if (!selected?.days) {
+    return series
+  }
+
+  const anchorTs = series[series.length - 1]?.ts ?? Date.now()
+  const cutoff = anchorTs - selected.days * 24 * 60 * 60 * 1000
+  const filtered = series.filter((point) => point.ts >= cutoff)
+  return filtered.length >= 2 ? filtered : series.slice(-Math.min(series.length, 30))
+})
+
+const modalChartPoints = computed(() => modalSeries.value.map((point) => point.close))
+
+const modalPeriodChangePct = computed(() => {
+  if (modalSeries.value.length < 2) {
+    return 0
+  }
+  const first = modalSeries.value[0]?.close ?? 0
+  const last = modalSeries.value[modalSeries.value.length - 1]?.close ?? 0
+  if (first === 0) {
+    return 0
+  }
+  return ((last - first) / first) * 100
+})
+
+const modalSeriesMeta = computed(() => {
+  if (!modalSeries.value.length) {
+    return { points: 0, from: '', to: '' }
+  }
+
+  const from = modalSeries.value[0]?.ts
+  const to = modalSeries.value[modalSeries.value.length - 1]?.ts
+
+  return {
+    points: modalSeries.value.length,
+    from: typeof from === 'number' && Number.isFinite(from) ? new Date(from).toLocaleDateString('fr-FR') : '',
+    to: typeof to === 'number' && Number.isFinite(to) ? new Date(to).toLocaleDateString('fr-FR') : '',
+  }
+})
+
 function mapRowsFromSeries(series: EtfTimeSeries[]): DashboardRow[] {
   const bySymbol = new Map(series.map((entry) => [entry.symbol, entry]))
 
   return assetList.map((asset) => {
     const sourceSeries = bySymbol.get(asset.symbol)
-    const closes = sourceSeries?.closes?.length ? sourceSeries.closes : buildFallbackSeries(asset.valueEur)
+    const parsedCloses = sourceSeries ? extractCloses(sourceSeries) : []
+    const closes = parsedCloses.length ? parsedCloses : buildFallbackSeries(asset.valueEur)
 
     const latest = closes[closes.length - 1] ?? 0
     const previous = closes[closes.length - 2] ?? latest
@@ -206,6 +392,8 @@ function mapRowsFromSeries(series: EtfTimeSeries[]): DashboardRow[] {
       price: latest,
       dailyChangePct: previous !== 0 ? ((latest - previous) / previous) * 100 : 0,
       monthChangePct: first !== 0 ? ((latest - first) / first) * 100 : 0,
+      provider: sourceSeries?.provider,
+      raw: sourceSeries?.raw,
     }
   })
 }
@@ -216,7 +404,7 @@ async function loadFromApi(): Promise<{ series: EtfTimeSeries[]; failures: strin
 
   for (const [index, asset] of assetList.entries()) {
     try {
-      series.push(await fetchAssetTimeSeries(asset.symbol, apiKey, asset.kind))
+      series.push(await fetchAssetTimeSeries(asset.symbol, apiKey, asset.kind, finnhubApiKey))
     } catch {
       failures.push(asset.name)
     }
@@ -283,6 +471,10 @@ async function refreshDashboard() {
       return
     }
 
+    if (MARKET_CACHE_ONLY) {
+      throw new Error("Mode cache actif: etf-cache.json est requis. Aucun appel API n'est fait.")
+    }
+
     const localCached = loadEtfCache()
     if (localCached?.data?.length) {
       rows.value = mapRowsFromSeries(localCached.data)
@@ -303,9 +495,7 @@ async function refreshDashboard() {
     dataSource.value = 'api'
     const nowIso = new Date().toISOString()
     lastUpdated.value = `${new Date(nowIso).toLocaleString('fr-FR')} (api)`
-    if (lastDataAtMs.value === null) {
-      applyLastDataTimestamp(nowIso)
-    }
+    applyLastDataTimestamp(nowIso)
 
     if (failures.length) {
       warningMessage.value = `Données indisponibles pour: ${failures.join(', ')}`
@@ -318,7 +508,7 @@ async function refreshDashboard() {
   }
 }
 
-async function refreshNewsSession() {
+async function refreshNewsSession(forceApi = false) {
   if (!isAuthenticated.value) {
     return
   }
@@ -330,7 +520,7 @@ async function refreshNewsSession() {
     await syncNewsCooldownFromFileSavedAt()
 
     const fileCached = await loadNewsFileCache()
-    if (fileCached?.data?.length) {
+    if (!forceApi && fileCached?.data?.length) {
       newsArticles.value = normalizeNewsArticles(fileCached.data)
       newsDataSource.value = 'file-cache'
       newsLastUpdated.value = `${new Date(fileCached.savedAt).toLocaleString('fr-FR')} (fichier)`
@@ -339,7 +529,7 @@ async function refreshNewsSession() {
     }
 
     const localCached = loadNewsLocalCache()
-    if (localCached?.data?.length) {
+    if (!forceApi && localCached?.data?.length) {
       newsArticles.value = normalizeNewsArticles(localCached.data)
       newsDataSource.value = 'local-cache'
       newsLastUpdated.value = `${new Date(localCached.savedAt).toLocaleString('fr-FR')} (local)`
@@ -354,9 +544,7 @@ async function refreshNewsSession() {
     newsDataSource.value = 'api'
     const nowIso = new Date().toISOString()
     newsLastUpdated.value = `${new Date(nowIso).toLocaleString('fr-FR')} (api)`
-    if (newsLastDataAtMs.value === null) {
-      applyNewsLastDataTimestamp(nowIso)
-    }
+    applyNewsLastDataTimestamp(nowIso)
   } catch (error) {
     newsArticles.value = []
     newsError.value = error instanceof Error ? error.message : 'Erreur inconnue.'
@@ -389,6 +577,16 @@ function logout() {
   warningMessage.value = ''
   newsArticles.value = []
   newsError.value = ''
+  selectedAsset.value = null
+}
+
+function openAssetModal(row: DashboardRow) {
+  modalRange.value = '1m'
+  selectedAsset.value = row
+}
+
+function closeAssetModal() {
+  selectedAsset.value = null
 }
 
 onMounted(() => {
@@ -471,7 +669,13 @@ onUnmounted(() => {
 
           <h2 class="section-title">ETF</h2>
           <section class="grid">
-            <article v-for="row in etfRows" :key="row.symbol" class="card" :style="{ '--asset-color': row.color }">
+            <article
+              v-for="row in etfRows"
+              :key="row.symbol"
+              class="card clickable"
+              :style="{ '--asset-color': row.color }"
+              @click="openAssetModal(row)"
+            >
               <div class="card-top">
                 <div class="asset-head">
                   <div class="asset-icon">{{ row.icon }}</div>
@@ -501,7 +705,13 @@ onUnmounted(() => {
 
           <h2 class="section-title">Titres</h2>
           <section class="grid">
-            <article v-for="row in titleRows" :key="row.symbol" class="card" :style="{ '--asset-color': row.color }">
+            <article
+              v-for="row in titleRows"
+              :key="row.symbol"
+              class="card clickable"
+              :style="{ '--asset-color': row.color }"
+              @click="openAssetModal(row)"
+            >
               <div class="card-top">
                 <div class="asset-head">
                   <div class="asset-icon">{{ row.icon }}</div>
@@ -536,7 +746,7 @@ onUnmounted(() => {
       <template v-else>
         <div class="toolbar">
           <div class="badge">Actualités FR</div>
-          <button class="refresh" :disabled="newsLoading || !canRefreshNews" @click="refreshNewsSession">
+          <button class="refresh" :disabled="newsLoading || !canRefreshNews" @click="refreshNewsSession(true)">
             {{ newsLoading ? 'Chargement...' : 'Actualiser actualités' }}
           </button>
         </div>
@@ -573,6 +783,53 @@ onUnmounted(() => {
         <footer class="meta">Actualités · Dernière mise à jour: {{ newsLastUpdated || 'n/a' }} · Source: {{ newsDataSource }}</footer>
       </template>
     </template>
+    <section v-if="selectedAsset" class="modal-backdrop" @click.self="closeAssetModal">
+      <article class="modal-card">
+        <header class="modal-head">
+          <div>
+            <p class="symbol">{{ selectedAsset.symbol }}</p>
+            <h3>{{ selectedAsset.icon }} {{ selectedAsset.name }}</h3>
+            <p class="category">Provider: {{ selectedAsset.provider || 'inconnu' }}</p>
+          </div>
+          <button class="logout" @click="closeAssetModal">Fermer</button>
+        </header>
+
+        <div class="modal-filters">
+          <button
+            v-for="option in modalRangeOptions"
+            :key="option.id"
+            class="news-cat-btn"
+            :class="modalRange === option.id ? 'active' : ''"
+            @click="modalRange = option.id"
+          >
+            {{ option.label }}
+          </button>
+        </div>
+
+        <SparklineChart
+          :key="`${selectedAsset.symbol}-${modalRange}-${modalChartPoints.length}`"
+          :points="modalChartPoints.length ? modalChartPoints : selectedAsset.closes"
+          :stroke="selectedAsset.color"
+        />
+
+        <div class="modal-stats">
+          <p>Période: {{ modalRange.toUpperCase() }}</p>
+          <p>Points: {{ modalSeriesMeta.points }}</p>
+          <p>De: {{ modalSeriesMeta.from || 'n/a' }}</p>
+          <p>À: {{ modalSeriesMeta.to || 'n/a' }}</p>
+          <p>Prix: {{ formatNumber(selectedAsset.price) }}</p>
+          <p>Variation 1j: {{ formatPercent(selectedAsset.dailyChangePct) }}</p>
+          <p>Variation 30j: {{ formatPercent(selectedAsset.monthChangePct) }}</p>
+          <p>Variation période: {{ formatPercent(modalPeriodChangePct) }}</p>
+          <p>Valeur: {{ formatNumber(selectedAsset.valueEur) }} €</p>
+        </div>
+
+        <details class="raw-box">
+          <summary>Données API complètes (raw)</summary>
+          <pre>{{ JSON.stringify(selectedAsset.raw || {}, null, 2) }}</pre>
+        </details>
+      </article>
+    </section>
   </main>
 </template>
 
@@ -712,6 +969,12 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
   background: linear-gradient(165deg, rgba(17, 25, 46, 0.94), rgba(9, 14, 24, 0.94));
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28), 0 0 0 1px color-mix(in srgb, var(--asset-color) 22%, transparent);
 }
+.card.clickable {
+  cursor: pointer;
+}
+.card.clickable:hover {
+  transform: translateY(-2px);
+}
 
 .card-top { display: flex; justify-content: space-between; gap: 0.8rem; }
 .asset-head {
@@ -766,6 +1029,64 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
 .up { color: #37e7a8; }
 .down { color: #ff7d9d; }
 .meta { margin-top: 1.25rem; color: #8097cd; font-size: 0.86rem; }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 16, 0.72);
+  backdrop-filter: blur(4px);
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  z-index: 50;
+}
+.modal-card {
+  width: min(900px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  border-radius: 1rem;
+  border: 1px solid #2f3b59;
+  background: linear-gradient(165deg, rgba(17, 25, 46, 0.98), rgba(9, 14, 24, 0.98));
+  padding: 1rem;
+}
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.6rem;
+}
+.modal-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.45rem;
+  margin: 0.8rem 0;
+  color: #c8d6ff;
+}
+.modal-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0.55rem 0 0.7rem;
+}
+.raw-box {
+  margin-top: 0.6rem;
+  border: 1px solid #2f3b59;
+  border-radius: 0.7rem;
+  padding: 0.6rem;
+  background: #0c1429;
+}
+.raw-box summary {
+  cursor: pointer;
+  color: #9eb4e8;
+}
+.raw-box pre {
+  margin: 0.6rem 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #b8cff8;
+  font-size: 0.78rem;
+}
 
 @media (max-width: 768px) {
   .hero { flex-direction: column; }
