@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import SparklineChart from './components/SparklineChart.vue'
 import type { AssetKind, EtfTimeSeries } from './services/alphaVantage'
 import type { NewsArticle, NewsCategory } from './services/newsApi'
@@ -61,6 +61,7 @@ const assetList: AssetDefinition[] = [
 const AUTH_KEY = 'dashboard-auth'
 const AUTH_TOKEN_KEY = 'dashboard-token'
 const REFRESH_INTERVAL_MS = 3 * 60 * 60 * 1000
+const NEWS_PAGE_SIZE = 12
 const authApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
 
 const activeSession = ref<'market' | 'news'>('market')
@@ -81,6 +82,9 @@ const newsDataSource = ref<'external-api' | 'db-cache' | 'db-cache-stale'>('db-c
 const newsLastDataAtMs = ref<number | null>(null)
 const newsArticles = ref<NewsArticle[]>([])
 const selectedNewsCategory = ref<'all' | NewsCategory>('all')
+const newsDateFrom = ref('')
+const newsDateTo = ref('')
+const newsPage = ref(1)
 
 const newsCategoryOptions: { id: 'all' | NewsCategory; label: string }[] = [
   { id: 'all', label: 'Toutes' },
@@ -172,11 +176,40 @@ const nextNewsRefreshLabel = computed(() => {
 })
 
 const filteredNewsArticles = computed(() => {
-  if (selectedNewsCategory.value === 'all') {
-    return newsArticles.value
+  let filtered = newsArticles.value
+
+  if (selectedNewsCategory.value !== 'all') {
+    filtered = filtered.filter((article) => article.category === selectedNewsCategory.value)
   }
 
-  return newsArticles.value.filter((article) => article.category === selectedNewsCategory.value)
+  const hasFrom = Boolean(newsDateFrom.value)
+  const hasTo = Boolean(newsDateTo.value)
+
+  if (!hasFrom && !hasTo) {
+    return filtered
+  }
+
+  const fromTs = hasFrom ? new Date(`${newsDateFrom.value}T00:00:00`).getTime() : Number.NEGATIVE_INFINITY
+  const toTs = hasTo ? new Date(`${newsDateTo.value}T23:59:59.999`).getTime() : Number.POSITIVE_INFINITY
+
+  if (!Number.isFinite(fromTs) || !Number.isFinite(toTs)) {
+    return filtered
+  }
+
+  return filtered.filter((article) => {
+    const publishedTs = new Date(article.publishedAt).getTime()
+    if (!Number.isFinite(publishedTs)) {
+      return false
+    }
+    return publishedTs >= fromTs && publishedTs <= toTs
+  })
+})
+
+const newsTotalPages = computed(() => Math.max(1, Math.ceil(filteredNewsArticles.value.length / NEWS_PAGE_SIZE)))
+
+const paginatedNewsArticles = computed(() => {
+  const start = (newsPage.value - 1) * NEWS_PAGE_SIZE
+  return filteredNewsArticles.value.slice(start, start + NEWS_PAGE_SIZE)
 })
 
 function formatPercent(value: number) {
@@ -249,9 +282,18 @@ function extractCloses(entry: EtfTimeSeries): number[] {
 
 type DatedPoint = { ts: number; close: number }
 
+function buildSyntheticDatedSeries(closes: number[], anchorTs = Date.now()): DatedPoint[] {
+  const dayMs = 24 * 60 * 60 * 1000
+  return closes.map((close, index) => ({
+    ts: anchorTs - (closes.length - 1 - index) * dayMs,
+    close,
+  }))
+}
+
 function getDatedSeriesFromRaw(row: DashboardRow): DatedPoint[] {
   if (!row.raw || typeof row.raw !== 'object') {
-    return row.closes.map((close, index) => ({ ts: index, close }))
+    const anchorTs = lastDataAtMs.value ?? Date.now()
+    return buildSyntheticDatedSeries(row.closes, anchorTs)
   }
 
   const raw = row.raw as Record<string, unknown>
@@ -314,7 +356,8 @@ function getDatedSeriesFromRaw(row: DashboardRow): DatedPoint[] {
     }
   }
 
-  return row.closes.map((close, index) => ({ ts: index, close }))
+  const anchorTs = lastDataAtMs.value ?? Date.now()
+  return buildSyntheticDatedSeries(row.closes, anchorTs)
 }
 
 const modalSeries = computed(() => {
@@ -365,6 +408,17 @@ const modalSeriesMeta = computed(() => {
     from: typeof from === 'number' && Number.isFinite(from) ? new Date(from).toLocaleDateString('fr-FR') : '',
     to: typeof to === 'number' && Number.isFinite(to) ? new Date(to).toLocaleDateString('fr-FR') : '',
   }
+})
+
+const modalMarketUpdatedAt = computed(() => {
+  if (lastDataAtMs.value === null) {
+    return 'n/a'
+  }
+
+  return new Date(lastDataAtMs.value).toLocaleString('fr-FR', {
+    dateStyle: 'short',
+    timeStyle: 'medium',
+  })
 })
 
 function mapRowsFromSeries(series: EtfTimeSeries[]): DashboardRow[] {
@@ -556,6 +610,29 @@ function closeAssetModal() {
   selectedAsset.value = null
 }
 
+function resetNewsDateFilters() {
+  newsDateFrom.value = ''
+  newsDateTo.value = ''
+}
+
+function goToNewsPage(page: number) {
+  const bounded = Math.min(Math.max(page, 1), newsTotalPages.value)
+  newsPage.value = bounded
+}
+
+watch(
+  () => [selectedNewsCategory.value, newsDateFrom.value, newsDateTo.value, newsArticles.value.length],
+  () => {
+    newsPage.value = 1
+  }
+)
+
+watch(newsTotalPages, (total) => {
+  if (newsPage.value > total) {
+    newsPage.value = total
+  }
+})
+
 onMounted(() => {
   refreshClock = window.setInterval(() => {
     nowMs.value = Date.now()
@@ -627,7 +704,20 @@ onUnmounted(() => {
         </p>
 
         <section v-if="errorMessage" class="state state-error">{{ errorMessage }}</section>
-        <section v-else-if="loading" class="state">Chargement des actifs...</section>
+        <section v-else-if="loading" class="market-loader" aria-live="polite" aria-busy="true">
+          <div class="loader-head">
+            <span class="loader-spinner" />
+            <p>Chargement du dashboard markets...</p>
+          </div>
+          <div class="loader-grid">
+            <article v-for="card in 6" :key="card" class="loader-card">
+              <div class="loader-line loader-line-lg" />
+              <div class="loader-line loader-line-md" />
+              <div class="loader-chart" />
+              <div class="loader-line loader-line-sm" />
+            </article>
+          </div>
+        </section>
         <section v-else>
           <p v-if="warningMessage" class="state state-warning">{{ warningMessage }}</p>
 
@@ -728,12 +818,29 @@ onUnmounted(() => {
             {{ option.label }}
           </button>
         </div>
+        <div class="news-date-filters">
+          <label class="news-date-field">
+            <span>Publié du</span>
+            <input v-model="newsDateFrom" type="date" />
+          </label>
+          <label class="news-date-field">
+            <span>Publié au</span>
+            <input v-model="newsDateTo" type="date" />
+          </label>
+          <button
+            class="news-reset-btn"
+            :disabled="!newsDateFrom && !newsDateTo"
+            @click="resetNewsDateFilters"
+          >
+            Réinitialiser
+          </button>
+        </div>
 
         <section v-if="newsError" class="state state-error">{{ newsError }}</section>
         <section v-else-if="newsLoading" class="state">Chargement des actualités...</section>
         <section v-else-if="!filteredNewsArticles.length" class="state">Aucun article pour cette catégorie.</section>
         <section v-else class="news-grid">
-          <article v-for="article in filteredNewsArticles" :key="article.url" class="news-card">
+          <article v-for="article in paginatedNewsArticles" :key="article.url" class="news-card">
             <img v-if="article.imageUrl" :src="article.imageUrl" :alt="article.title" class="news-image" />
             <div class="news-content">
               <p class="news-source">{{ article.source }} · {{ new Date(article.publishedAt).toLocaleString('fr-FR') }}</p>
@@ -743,6 +850,15 @@ onUnmounted(() => {
             </div>
           </article>
         </section>
+        <nav v-if="filteredNewsArticles.length > NEWS_PAGE_SIZE" class="news-pagination" aria-label="Pagination actualités">
+          <button class="news-page-btn" :disabled="newsPage <= 1" @click="goToNewsPage(newsPage - 1)">
+            Précédent
+          </button>
+          <p class="news-page-label">Page {{ newsPage }} / {{ newsTotalPages }}</p>
+          <button class="news-page-btn" :disabled="newsPage >= newsTotalPages" @click="goToNewsPage(newsPage + 1)">
+            Suivant
+          </button>
+        </nav>
 
         <footer class="meta">Actualités · Dernière mise à jour: {{ newsLastUpdated || 'n/a' }} · Source: {{ newsDataSource }}</footer>
       </template>
@@ -777,6 +893,7 @@ onUnmounted(() => {
         />
 
         <div class="modal-stats">
+          <p>Mise à jour données: {{ modalMarketUpdatedAt }}</p>
           <p>Période: {{ modalRange.toUpperCase() }}</p>
           <p>Points: {{ modalSeriesMeta.points }}</p>
           <p>De: {{ modalSeriesMeta.from || 'n/a' }}</p>
@@ -897,6 +1014,42 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
   gap: 0.45rem;
   margin: 0 0 1rem;
 }
+.news-date-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: end;
+  margin: 0 0 1rem;
+}
+.news-date-field {
+  display: grid;
+  gap: 0.3rem;
+}
+.news-date-field span {
+  color: #9eb4e8;
+  font-size: 0.8rem;
+}
+.news-date-field input {
+  border: 1px solid #2c3b60;
+  border-radius: 0.6rem;
+  background: #111a30;
+  color: #d9eeff;
+  padding: 0.45rem 0.55rem;
+  min-height: 2.2rem;
+}
+.news-reset-btn {
+  border: 1px solid #2c3b60;
+  border-radius: 0.6rem;
+  background: #141f3a;
+  color: #b8cff8;
+  padding: 0.45rem 0.75rem;
+  min-height: 2.2rem;
+  cursor: pointer;
+}
+.news-reset-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
 .news-cat-btn {
   border: 1px solid #2c3b60;
   border-radius: 999px;
@@ -917,6 +1070,73 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
   border: 1px solid #2f3b59;
   background: rgba(10, 16, 32, 0.72);
   margin-bottom: 1rem;
+}
+.market-loader {
+  padding: 1rem;
+  border-radius: 0.9rem;
+  border: 1px solid #2f3b59;
+  background: rgba(10, 16, 32, 0.72);
+  margin-bottom: 1rem;
+}
+.loader-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+  color: #c8d6ff;
+}
+.loader-head p {
+  margin: 0;
+  font-size: 0.95rem;
+}
+.loader-spinner {
+  width: 1rem;
+  height: 1rem;
+  border-radius: 999px;
+  border: 2px solid rgba(173, 200, 255, 0.3);
+  border-top-color: #36f2a9;
+  animation: spin 0.75s linear infinite;
+}
+.loader-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(255px, 1fr));
+}
+.loader-card {
+  border-radius: 1rem;
+  border: 1px solid #2a3554;
+  padding: 0.9rem;
+  background: linear-gradient(165deg, rgba(17, 25, 46, 0.72), rgba(9, 14, 24, 0.72));
+}
+.loader-line,
+.loader-chart {
+  position: relative;
+  overflow: hidden;
+  border-radius: 0.6rem;
+  background: #172440;
+}
+.loader-line::after,
+.loader-chart::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(102, 205, 255, 0.22), transparent);
+  animation: shimmer 1.2s ease-in-out infinite;
+}
+.loader-line {
+  height: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+.loader-line-lg { width: 74%; }
+.loader-line-md { width: 52%; }
+.loader-line-sm {
+  width: 38%;
+  margin-bottom: 0;
+}
+.loader-chart {
+  height: 4.4rem;
+  margin: 0.8rem 0;
 }
 .state-error { color: #ffbac7; border-color: #8f2f4d; }
 .state-warning { color: #ffe9a8; border-color: #6f5f2a; }
@@ -989,6 +1209,31 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
 .news-title { margin: 0.45rem 0; font-size: 1rem; }
 .news-desc { margin: 0; color: #c9d6f8; font-size: 0.9rem; }
 .news-link { display: inline-block; margin-top: 0.65rem; color: #49d4ff; text-decoration: none; }
+.news-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+.news-page-btn {
+  border: 1px solid #2c3b60;
+  border-radius: 0.65rem;
+  background: #141f3a;
+  color: #d9eeff;
+  min-width: 6.8rem;
+  padding: 0.45rem 0.75rem;
+  cursor: pointer;
+}
+.news-page-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.news-page-label {
+  margin: 0;
+  color: #9eb4e8;
+  font-size: 0.9rem;
+}
 
 .up { color: #37e7a8; }
 .down { color: #ff7d9d; }
@@ -1055,5 +1300,17 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
 @media (max-width: 768px) {
   .hero { flex-direction: column; }
   .hero-actions { width: 100%; flex-wrap: wrap; justify-content: flex-start; }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
 }
 </style>
