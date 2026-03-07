@@ -25,11 +25,30 @@ interface DashboardRow extends AssetDefinition {
   raw?: unknown
 }
 
+interface MarketHistorySeries {
+  symbol: string
+  provider?: 'alpha_vantage' | 'finnhub' | 'yahoo'
+  dates: string[]
+  closes: number[]
+}
+
+interface HistoryRow extends AssetDefinition {
+  provider?: 'alpha_vantage' | 'finnhub' | 'yahoo'
+  dates: string[]
+  closes: number[]
+}
+
 interface MarketsApiResponse {
   source: string
   savedAt: string
   data: EtfTimeSeries[]
   failures?: string[]
+}
+
+interface MarketHistoryApiResponse {
+  source: string
+  savedAt: string
+  data: MarketHistorySeries[]
 }
 
 interface NewsApiResponse {
@@ -62,9 +81,9 @@ const AUTH_KEY = 'dashboard-auth'
 const AUTH_TOKEN_KEY = 'dashboard-token'
 const REFRESH_INTERVAL_MS = 3 * 60 * 60 * 1000
 const NEWS_PAGE_SIZE = 12
-const authApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000').replace(/\/+$/, '')
+const authApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/+$/, '')
 
-const activeSession = ref<'market' | 'news'>('market')
+const activeSession = ref<'market' | 'news' | 'history'>('market')
 
 const loading = ref(false)
 const errorMessage = ref('')
@@ -81,6 +100,10 @@ const newsLastUpdated = ref('')
 const newsDataSource = ref<'external-api' | 'db-cache' | 'db-cache-stale'>('db-cache')
 const newsLastDataAtMs = ref<number | null>(null)
 const newsArticles = ref<NewsArticle[]>([])
+const historyLoading = ref(false)
+const historyError = ref('')
+const historyLastUpdated = ref('')
+const historyRows = ref<HistoryRow[]>([])
 const selectedNewsCategory = ref<'all' | NewsCategory>('all')
 const newsDateFrom = ref('')
 const newsDateTo = ref('')
@@ -103,6 +126,7 @@ const username = ref('')
 const password = ref('')
 const isAuthenticated = ref(Boolean(sessionStorage.getItem(AUTH_TOKEN_KEY)))
 const selectedAsset = ref<DashboardRow | null>(null)
+const selectedHistoryAsset = ref<HistoryRow | null>(null)
 const modalRange = ref<'5d' | '1m' | '3m' | 'max'>('1m')
 
 const modalRangeOptions: Array<{ id: '5d' | '1m' | '3m' | 'max'; label: string; days?: number }> = [
@@ -221,6 +245,19 @@ function formatNumber(value: number, maxFractionDigits = 2) {
     minimumFractionDigits: 0,
     maximumFractionDigits: maxFractionDigits,
   })
+}
+
+function formatMarketSource(provider?: DashboardRow['provider']) {
+  if (provider === 'alpha_vantage') {
+    return 'Alpha Vantage'
+  }
+  if (provider === 'finnhub') {
+    return 'Finnhub'
+  }
+  if (provider === 'yahoo') {
+    return 'Yahoo Finance'
+  }
+  return 'Inconnue'
 }
 
 function buildFallbackSeries(baseValue: number): number[] {
@@ -382,6 +419,11 @@ const modalSeries = computed(() => {
 })
 
 const modalChartPoints = computed(() => modalSeries.value.map((point) => point.close))
+const modalChartLabels = computed(() =>
+  modalSeries.value.map((point) =>
+    new Date(point.ts).toLocaleDateString('fr-FR', { year: 'numeric', month: '2-digit', day: '2-digit' })
+  )
+)
 
 const modalPeriodChangePct = computed(() => {
   if (modalSeries.value.length < 2) {
@@ -421,6 +463,28 @@ const modalMarketUpdatedAt = computed(() => {
   })
 })
 
+const historyModalPoints = computed(() => {
+  if (!selectedHistoryAsset.value) {
+    return [] as Array<{ date: string; close: number }>
+  }
+
+  return selectedHistoryAsset.value.dates
+    .map((date, index) => ({ date, close: selectedHistoryAsset.value?.closes[index] ?? Number.NaN }))
+    .filter((entry) => Number.isFinite(entry.close))
+})
+
+const historyModalMeta = computed(() => {
+  if (!historyModalPoints.value.length) {
+    return { points: 0, from: 'n/a', to: 'n/a' }
+  }
+
+  return {
+    points: historyModalPoints.value.length,
+    from: historyModalPoints.value[0]?.date || 'n/a',
+    to: historyModalPoints.value[historyModalPoints.value.length - 1]?.date || 'n/a',
+  }
+})
+
 function mapRowsFromSeries(series: EtfTimeSeries[]): DashboardRow[] {
   const bySymbol = new Map(series.map((entry) => [entry.symbol, entry]))
 
@@ -443,6 +507,27 @@ function mapRowsFromSeries(series: EtfTimeSeries[]): DashboardRow[] {
       raw: sourceSeries?.raw,
     }
   })
+}
+
+function mapRowsFromHistory(series: MarketHistorySeries[]): HistoryRow[] {
+  const bySymbol = new Map(series.map((entry) => [entry.symbol, entry]))
+  const mapped: HistoryRow[] = []
+
+  for (const asset of assetList) {
+    const history = bySymbol.get(asset.symbol)
+    if (!history || history.closes.length < 2 || history.dates.length < 2) {
+      continue
+    }
+
+    mapped.push({
+      ...asset,
+      provider: history.provider,
+      dates: history.dates,
+      closes: history.closes,
+    })
+  }
+
+  return mapped
 }
 
 function applyLastDataTimestamp(rawDate: string) {
@@ -550,6 +635,41 @@ async function refreshNewsSession(forceApi = false) {
   }
 }
 
+async function refreshHistorySession() {
+  if (!isAuthenticated.value) {
+    return
+  }
+
+  historyLoading.value = true
+  historyError.value = ''
+
+  try {
+    const token = getAuthToken()
+    const response = await fetch(`${authApiBaseUrl}/data/markets-history`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    })
+
+    const payload = await parseJsonResponse<MarketHistoryApiResponse & { message?: string }>(
+      response,
+      'Erreur historique marchés'
+    )
+
+    if (!response.ok) {
+      throw new Error(payload.message || 'Erreur API historique marchés.')
+    }
+
+    historyRows.value = mapRowsFromHistory(payload.data || [])
+    historyLastUpdated.value = new Date(payload.savedAt).toLocaleString('fr-FR')
+  } catch (error) {
+    historyRows.value = []
+    historyError.value = error instanceof Error ? error.message : 'Erreur inconnue.'
+  } finally {
+    historyLoading.value = false
+  }
+}
+
 async function submitLogin() {
   authError.value = ''
 
@@ -581,6 +701,7 @@ async function submitLogin() {
     isAuthenticated.value = true
     void refreshDashboard()
     void refreshNewsSession()
+    void refreshHistorySession()
     return
   } catch (_error) {
     authError.value = "Impossible de contacter l'API d'authentification."
@@ -598,16 +719,29 @@ function logout() {
   warningMessage.value = ''
   newsArticles.value = []
   newsError.value = ''
+  historyRows.value = []
+  historyError.value = ''
   selectedAsset.value = null
+  selectedHistoryAsset.value = null
 }
 
 function openAssetModal(row: DashboardRow) {
+  selectedHistoryAsset.value = null
   modalRange.value = '1m'
   selectedAsset.value = row
 }
 
 function closeAssetModal() {
   selectedAsset.value = null
+}
+
+function openHistoryModal(row: HistoryRow) {
+  selectedAsset.value = null
+  selectedHistoryAsset.value = row
+}
+
+function closeHistoryModal() {
+  selectedHistoryAsset.value = null
 }
 
 function resetNewsDateFilters() {
@@ -641,6 +775,7 @@ onMounted(() => {
   if (isAuthenticated.value) {
     void refreshDashboard()
     void refreshNewsSession()
+    void refreshHistorySession()
   }
 })
 
@@ -687,6 +822,7 @@ onUnmounted(() => {
           <div class="session-switch">
             <button class="session-btn" :class="activeSession === 'market' ? 'active' : ''" @click="activeSession = 'market'">Marchés</button>
             <button class="session-btn" :class="activeSession === 'news' ? 'active' : ''" @click="activeSession = 'news'">Actualités</button>
+            <button class="session-btn" :class="activeSession === 'history' ? 'active' : ''" @click="activeSession = 'history'">Historique</button>
           </div>
           <button class="logout" @click="logout">Déconnexion</button>
         </div>
@@ -753,6 +889,7 @@ onUnmounted(() => {
                 <p>Quantité: {{ formatNumber(row.units, 6) }}</p>
                 <p>Valeur: {{ formatNumber(row.valueEur) }} €</p>
                 <p v-if="row.weightPct !== undefined">Poids: {{ formatPercent(row.weightPct) }}</p>
+                <p>Source: {{ formatMarketSource(row.provider) }}</p>
               </div>
             </article>
           </section>
@@ -789,6 +926,7 @@ onUnmounted(() => {
                 <p>Quantité: {{ formatNumber(row.units, 6) }}</p>
                 <p>Valeur: {{ formatNumber(row.valueEur) }} €</p>
                 <p v-if="row.weightPct !== undefined">Poids: {{ formatPercent(row.weightPct) }}</p>
+                <p>Source: {{ formatMarketSource(row.provider) }}</p>
               </div>
             </article>
           </section>
@@ -797,7 +935,7 @@ onUnmounted(() => {
         <footer class="meta">Marchés · Dernière mise à jour: {{ lastUpdated || 'n/a' }} · Source: {{ dataSource }}</footer>
       </template>
 
-      <template v-else>
+      <template v-else-if="activeSession === 'news'">
         <div class="toolbar">
           <div class="badge">Actualités FR</div>
           <button class="refresh" :disabled="newsLoading || !canRefreshNews" @click="refreshNewsSession(true)">
@@ -862,6 +1000,51 @@ onUnmounted(() => {
 
         <footer class="meta">Actualités · Dernière mise à jour: {{ newsLastUpdated || 'n/a' }} · Source: {{ newsDataSource }}</footer>
       </template>
+      <template v-else>
+        <div class="toolbar">
+          <div class="badge">Historique market global (BDD)</div>
+          <button class="refresh" :disabled="historyLoading" @click="refreshHistorySession">
+            {{ historyLoading ? 'Chargement...' : 'Actualiser historique' }}
+          </button>
+        </div>
+
+        <section v-if="historyError" class="state state-error">{{ historyError }}</section>
+        <section v-else-if="historyLoading" class="state">Chargement de l'historique...</section>
+        <section v-else-if="!historyRows.length" class="state">Aucune donnée historique disponible.</section>
+        <section v-else class="grid">
+          <article
+            v-for="row in historyRows"
+            :key="row.symbol"
+            class="card clickable"
+            :style="{ '--asset-color': row.color }"
+            @click="openHistoryModal(row)"
+          >
+            <div class="card-top">
+              <div class="asset-head">
+                <div class="asset-icon">{{ row.icon }}</div>
+                <div>
+                  <p class="symbol">{{ row.symbol }}</p>
+                  <h3>{{ row.name }}</h3>
+                </div>
+                <p class="category">Type: {{ row.kind === 'crypto' ? 'Crypto' : 'Action/ETF' }}</p>
+              </div>
+            </div>
+
+            <SparklineChart :points="row.closes" :stroke="row.color" :labels="row.dates" />
+
+            <div class="footer">
+              <p>Points journaliers: {{ row.closes.length }}</p>
+              <p>Du: {{ row.dates[0] }}</p>
+              <p>Au: {{ row.dates[row.dates.length - 1] }}</p>
+              <p>Source: {{ formatMarketSource(row.provider) }}</p>
+            </div>
+          </article>
+        </section>
+
+        <footer class="meta">
+          Historique marchés · Dernière mise à jour en base: {{ historyLastUpdated || 'n/a' }} · Source: db-history
+        </footer>
+      </template>
     </template>
     <section v-if="selectedAsset" class="modal-backdrop" @click.self="closeAssetModal">
       <article class="modal-card">
@@ -890,6 +1073,7 @@ onUnmounted(() => {
           :key="`${selectedAsset.symbol}-${modalRange}-${modalChartPoints.length}`"
           :points="modalChartPoints.length ? modalChartPoints : selectedAsset.closes"
           :stroke="selectedAsset.color"
+          :labels="modalChartLabels"
         />
 
         <div class="modal-stats">
@@ -909,6 +1093,41 @@ onUnmounted(() => {
           <summary>Données API complètes (raw)</summary>
           <pre>{{ JSON.stringify(selectedAsset.raw || {}, null, 2) }}</pre>
         </details>
+      </article>
+    </section>
+    <section v-if="selectedHistoryAsset" class="modal-backdrop" @click.self="closeHistoryModal">
+      <article class="modal-card">
+        <header class="modal-head">
+          <div>
+            <p class="symbol">{{ selectedHistoryAsset.symbol }}</p>
+            <h3>{{ selectedHistoryAsset.icon }} {{ selectedHistoryAsset.name }}</h3>
+            <p class="category">Source: {{ formatMarketSource(selectedHistoryAsset.provider) }}</p>
+          </div>
+          <button class="logout" @click="closeHistoryModal">Fermer</button>
+        </header>
+
+        <SparklineChart
+          :key="`history-${selectedHistoryAsset.symbol}-${selectedHistoryAsset.closes.length}`"
+          :points="selectedHistoryAsset.closes"
+          :stroke="selectedHistoryAsset.color"
+          :labels="selectedHistoryAsset.dates"
+        />
+
+        <div class="modal-stats">
+          <p>Points: {{ historyModalMeta.points }}</p>
+          <p>Du: {{ historyModalMeta.from }}</p>
+          <p>Au: {{ historyModalMeta.to }}</p>
+          <p>Dernière valeur: {{ formatNumber(selectedHistoryAsset.closes[selectedHistoryAsset.closes.length - 1] ?? 0) }}</p>
+        </div>
+
+        <div class="history-points-box">
+          <h4>Points journaliers (date / valeur)</h4>
+          <div class="history-points-list">
+            <p v-for="point in historyModalPoints" :key="`${selectedHistoryAsset.symbol}-${point.date}`">
+              {{ point.date }} · {{ formatNumber(point.close) }}
+            </p>
+          </div>
+        </div>
       </article>
     </section>
   </main>
@@ -1277,6 +1496,32 @@ h3 { margin: 0.4rem 0 0.35rem; font-size: 1.04rem; }
   flex-wrap: wrap;
   gap: 0.45rem;
   margin: 0.55rem 0 0.7rem;
+}
+.history-points-box {
+  margin-top: 0.8rem;
+  border: 1px solid #2f3b59;
+  border-radius: 0.7rem;
+  padding: 0.7rem;
+  background: #0c1429;
+}
+.history-points-box h4 {
+  margin: 0 0 0.55rem;
+  color: #c8d6ff;
+  font-size: 0.95rem;
+}
+.history-points-list {
+  max-height: 220px;
+  overflow: auto;
+  display: grid;
+  gap: 0.35rem;
+}
+.history-points-list p {
+  margin: 0;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.45rem;
+  background: #101b35;
+  color: #b8cff8;
+  font-size: 0.85rem;
 }
 .raw-box {
   margin-top: 0.6rem;
